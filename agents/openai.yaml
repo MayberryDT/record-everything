@@ -1,0 +1,3 @@
+interface:
+  display_name: "Record Everything"
+  short_description: "Record app events as facts; read them with facts"

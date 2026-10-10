@@ -1,0 +1,1386 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["duckdb>=1.1,<2", "pyyaml>=6"]
+# ///
+"""facts: read an app's recorded facts. Agent-first; run `facts guide` for the handbook.
+
+stdout is one JSON document per run (or a table with --table); diagnostics go to stderr.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import difflib
+import fcntl
+import gzip
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+VERSION = "1.0.0"
+CONTRACT_VERSION = 1
+OK, USAGE, CONTRACT, NOT_SYNCED, SOURCE, CHECK_FAILED, BUSY, INTERNAL = 0, 1, 2, 3, 4, 5, 6, 7
+EXIT_CODES = {
+    0: "success",
+    1: "usage: bad command, flag, SQL, kind, era or session; the error names the fix",
+    2: "contract: facts.md missing or invalid",
+    3: "not synced: no local data yet; run `facts sync`",
+    4: "source: the archive could not be listed, fetched or read; a rerun resumes",
+    5: "check failed: `facts check` found a fail-level problem (or a warning with --strict)",
+    6: "busy: another `facts sync` holds the database; wait for it and retry",
+    7: "internal: a bug in facts itself; the message says where",
+}
+DEFAULT_FIELDS = {"kind": "kind", "t": "t", "session": "session", "build": "build", "actor": "actor", "target": "target",
+                  "who": "who"}
+STORE_VERSION = 2  # bump when the stored tables change shape; forces a rebuild from the raw files
+WHO = ("human", "bot", "agent", "system")
+SKILL_DIR = Path(__file__).resolve().parent.parent
+TEMPLATE = SKILL_DIR / "assets" / "facts.md"
+
+
+class Fail(Exception):
+    def __init__(self, code: int, message: str, try_: list[str] | None = None, **detail):
+        super().__init__(message)
+        self.code, self.message, self.try_, self.detail = code, message, try_ or [], detail
+
+
+def log(message: str) -> None:
+    print(f"facts: {message}", file=sys.stderr, flush=True)
+
+
+def plain(value):
+    """A JSON-ready value; JSON columns come back as text and are parsed."""
+    if isinstance(value, dt.datetime):
+        return value.isoformat() + ("Z" if value.tzinfo is None else "")
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (list, tuple)):
+        return [plain(v) for v in value]
+    if isinstance(value, dict):
+        return {k: plain(v) for k, v in value.items()}
+    if hasattr(value, "is_finite"):  # Decimal
+        return float(value)
+    return value
+
+
+def iso(ms) -> str | None:
+    if ms is None:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def q(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def shell(arg: str) -> str:
+    return arg if re.fullmatch(r"[\w@%+=:,./-]+", arg) else "'" + arg.replace("'", "'\\''") + "'"
+
+
+# ---------------------------------------------------------------- contract
+
+class Contract:
+    def __init__(self, path: Path):
+        self.path = path.resolve()
+        self.root = self.path.parent
+        text = self.path.read_text()
+        m = re.match(r"^---\s*\n(.*?)\n---\s*(\n|$)", text, re.S)
+        if not m:
+            raise Fail(CONTRACT, f"{self.path} has no YAML front matter between --- lines",
+                       [f"cat {shell(str(TEMPLATE))}"])
+        import yaml
+        try:
+            raw = yaml.safe_load(m.group(1)) or {}
+        except yaml.YAMLError as e:
+            raise Fail(CONTRACT, f"{self.path}: front matter is not valid YAML: {e}")
+        if not isinstance(raw, dict):
+            raise Fail(CONTRACT, f"{self.path}: front matter must be a mapping")
+        self.raw = raw
+        if raw.get("facts") != CONTRACT_VERSION:
+            raise Fail(CONTRACT, f"{self.path}: set `facts: {CONTRACT_VERSION}` (contract version) in the front matter")
+        self.name = str(raw.get("name") or "")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", self.name):
+            raise Fail(CONTRACT, f"{self.path}: `name` must be lowercase letters, digits, '.', '_' or '-' (got {self.name!r})")
+        self.source = raw.get("source") or {}
+        kind = self.source.get("kind")
+        if kind not in ("http", "dir"):
+            raise Fail(CONTRACT, f"{self.path}: `source.kind` must be `http` or `dir` (got {kind!r})",
+                       ["facts guide contract"])
+        if kind == "http" and not (self.source.get("list") and "{key}" in str(self.source.get("get", ""))):
+            raise Fail(CONTRACT, f"{self.path}: an http source needs `source.list` (URL) and `source.get` (URL containing {{key}})")
+        if kind == "dir" and not self.source.get("path"):
+            raise Fail(CONTRACT, f"{self.path}: a dir source needs `source.path`")
+        fields = raw.get("fields") or {}
+        unknown = sorted(set(fields) - set(DEFAULT_FIELDS))
+        if unknown:
+            raise Fail(CONTRACT, f"{self.path}: unknown `fields` keys {unknown}; allowed: {sorted(DEFAULT_FIELDS)}")
+        self.fields = {**DEFAULT_FIELDS, **{k: str(v) for k, v in fields.items()}}
+        self.admin_kinds = [str(k) for k in (raw.get("admin_kinds") or ["admin"])]
+        self.actor_sql = raw.get("actor_sql")
+        self.restart_sql = raw.get("restart_sql")
+        self.exposure = raw.get("exposure")
+        self.views = raw.get("views") or {}
+        self.kinds = raw.get("kinds") or {}
+        self.bulky = [str(k) for k in (raw.get("bulky") or [])]
+        self.sessionless = [str(k) for k in (raw.get("sessionless") or [])]
+        self.measures = raw.get("measures") or {}
+        self.checks = raw.get("checks") or {}
+        self.minimums = {"events": 20, "exposure_hours": 0.5, "sessions": 5, **(raw.get("minimums") or {})}
+        self.fresh_hours = raw.get("fresh_hours")
+        self.budget = raw.get("budget") or {}
+        self.environment = raw.get("environment")
+        for key, value in (("views", self.views), ("kinds", self.kinds), ("measures", self.measures), ("checks", self.checks)):
+            if not isinstance(value, dict):
+                raise Fail(CONTRACT, f"{self.path}: `{key}` must be a mapping of name to definition")
+        cache = os.environ.get("FACTS_CACHE") or raw.get("cache")
+        self.cache = (self.root / Path(cache).expanduser()) if cache else Path.home() / ".cache" / "facts" / self.name
+        self.cache = self.cache.resolve()
+        self.db_path = self.cache / "facts.duckdb"
+
+    def mapping_hash(self) -> str:
+        blob = json.dumps({"fields": self.fields, "admin": self.admin_kinds, "actor_sql": self.actor_sql,
+                           "restart_sql": self.restart_sql, "store": STORE_VERSION}, sort_keys=True)
+        return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+    def expr(self, name: str) -> str:
+        value = self.fields[name]
+        if re.fullmatch(r"[A-Za-z_][\w-]*(\.[A-Za-z_][\w-]*)*", value):
+            path = "$" + "".join(f'."{part}"' for part in value.split("."))
+            return f"json_extract_string(json, {q(path)})"
+        return f"({value})"
+
+    def eras(self) -> list[dict]:
+        eras = self.raw.get("eras")
+        if isinstance(eras, str):
+            path = (self.root / eras).resolve()
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError) as e:
+                raise Fail(CONTRACT, f"`eras` points to {path}, which could not be read as JSON: {e}")
+            eras = data.get("eras") if isinstance(data, dict) else data
+        return [e for e in (eras or []) if isinstance(e, dict) and e.get("id")]
+
+
+def find_contract(args) -> Contract:
+    explicit = args.contract or os.environ.get("FACTS_CONTRACT")
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_file():
+            raise Fail(CONTRACT, f"contract file {path} does not exist")
+        return Contract(path)
+    start = Path(args.project or os.getcwd()).resolve()
+    searched = []
+    for directory in (start, *start.parents):
+        searched.append(str(directory))
+        if (directory / "facts.md").is_file():
+            return Contract(directory / "facts.md")
+    raise Fail(CONTRACT, f"no facts.md in {start} or any parent directory",
+               ["facts init --name <app>  # writes a starting facts.md here",
+                "facts --project <app-dir>  # if the app lives elsewhere"], searched=searched[:6])
+
+
+# ---------------------------------------------------------------- database
+
+def open_db(c: Contract, write: bool = False):
+    import duckdb
+    if not write and not c.db_path.exists():
+        raise Fail(NOT_SYNCED, f"nothing synced yet for {c.name} (expected {c.db_path})", ["facts sync"])
+    c.cache.mkdir(parents=True, exist_ok=True)
+    try:
+        con = duckdb.connect(str(c.db_path), read_only=not write)
+    except duckdb.IOException as e:
+        if "lock" in str(e).lower():
+            raise Fail(BUSY, f"another `facts sync` is using {c.db_path}; retry when it finishes")
+        raise
+    con.execute(f"SET memory_limit = {q(memory_limit())}")
+    (c.cache / "tmp").mkdir(exist_ok=True)
+    con.execute(f"SET temp_directory = {q(str(c.cache / 'tmp'))}")  # big reads spill here instead of failing
+    if write:
+        con.execute("SET preserve_insertion_order = false")
+    if not write:
+        BROKEN_VIEWS.clear()
+        BROKEN_VIEWS.update(define_views(con, c))
+    return con
+
+
+BROKEN_VIEWS: dict = {}
+
+
+def memory_limit() -> str:
+    """DuckDB defaults to 80% of RAM, which gets a shared build host's process killed. Default: a quarter of RAM."""
+    if os.environ.get("FACTS_MEMORY"):
+        return os.environ["FACTS_MEMORY"]
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError):
+        return "2GB"
+    return f"{max(1, total // 4 // 2**30)}GB"
+
+
+def table_exists(con, name: str) -> bool:
+    return bool(con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = ? AND NOT temporary", [name]).fetchone()[0])
+
+
+def define_views(con, c: Contract) -> dict:
+    """Temp views over the stored tables: always match the current facts.md."""
+    if not table_exists(con, "facts_all"):
+        raise Fail(NOT_SYNCED, "the local database has no facts yet", ["facts sync"])
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW all_facts AS
+        SELECT f.* REPLACE (CASE WHEN a.class = 'agent' THEN 'agent' ELSE coalesce(f.who, a.class) END AS who),
+               ta.class AS target_who, CAST(f.ts AS DATE) AS day, coalesce(s.admin, false) AS admin_session
+        FROM facts_all f
+        LEFT JOIN actors a ON a.session = f.session AND a.segment = f.segment AND a.actor = f.actor
+        LEFT JOIN actors ta ON ta.session = f.session AND ta.segment = f.segment AND ta.actor = f.target
+        LEFT JOIN sessions s ON s.session = f.session""")
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW facts AS
+        SELECT * EXCLUDE (admin_session) FROM all_facts
+        WHERE NOT admin_session AND who IS DISTINCT FROM 'agent'""")
+    broken = {}
+    if c.exposure:
+        try:
+            con.execute(f"CREATE OR REPLACE TEMP VIEW exposure AS WITH source AS (SELECT * FROM facts) {c.exposure}")
+            con.execute(f"CREATE OR REPLACE TEMP VIEW exposure_all AS WITH source AS (SELECT * FROM all_facts) {c.exposure}")
+        except Exception as e:
+            broken["exposure"] = str(e).splitlines()[0]
+    for name, sql in c.views.items():
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", str(name)):
+            broken[name] = "view names must be lowercase identifiers"
+            continue
+        try:
+            con.execute(f"CREATE OR REPLACE TEMP VIEW {name} AS {sql}")
+        except Exception as e:  # a broken contract view must not break the tool
+            broken[name] = str(e).splitlines()[0]
+    return broken
+
+
+def meta(con, key: str):
+    row = con.execute("SELECT value FROM meta WHERE key = ?", [key]).fetchone() if table_exists(con, "meta") else None
+    return row[0] if row else None
+
+
+# ---------------------------------------------------------------- source
+
+def token(c: Contract) -> str | None:
+    env, path = c.source.get("token_env"), c.source.get("token_file")
+    if env and os.environ.get(env):
+        return os.environ[env].strip()
+    if path:
+        p = Path(path).expanduser()
+        try:
+            return p.read_text().strip()
+        except OSError:
+            raise Fail(SOURCE, f"token file {p} is missing or unreadable" + (f" (or set {env})" if env else ""))
+    if env:
+        raise Fail(SOURCE, f"set {env} to the archive token")
+    return None
+
+
+def fetch(url: str, tok: str | None, attempts: int = 4, timeout: int = 60) -> bytes:
+    headers = {"user-agent": f"facts/{VERSION}"}
+    if tok:
+        headers["authorization"] = f"Bearer {tok}"
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise Fail(SOURCE, f"the source rejected the token (HTTP {e.code}) for {redact(url)}",
+                           ["check source.token_file / source.token_env in facts.md"])
+            if e.code < 500 and e.code != 429:
+                raise Fail(SOURCE, f"HTTP {e.code} from {redact(url)}: {e.read()[:200].decode('utf8', 'replace')}")
+            failure = f"HTTP {e.code}"
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            failure = str(getattr(e, "reason", e))
+        if attempt == attempts:
+            raise Fail(SOURCE, f"gave up on {redact(url)} after {attempts} attempts ({failure}); run `facts sync` again to resume")
+        log(f"retrying {redact(url)} ({failure})")
+        time.sleep(0.5 * 2 ** (attempt - 1))
+    raise AssertionError
+
+
+def redact(url: str) -> str:
+    return re.sub(r"(token|key|sig|signature)=[^&]+", r"\1=…", url)
+
+
+def list_source(c: Contract, tok: str | None) -> list[dict]:
+    if c.source["kind"] == "dir":
+        base = (c.root / Path(c.source["path"]).expanduser()).resolve()
+        if not base.is_dir():
+            raise Fail(SOURCE, f"source.path {base} is not a directory")
+        files = sorted(p for p in base.rglob("*") if p.is_file() and (p.name.endswith(".jsonl.gz") or p.name.endswith(".jsonl")))
+        return [{"key": str(p.relative_to(base)), "size": p.stat().st_size, "path": p} for p in files]
+    objects, cursor = [], None
+    while True:
+        parts = urllib.parse.urlsplit(c.source["list"])
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True) + ([("cursor", cursor)] if cursor else [])
+        url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+        try:
+            page = json.loads(fetch(url, tok))
+        except json.JSONDecodeError:
+            raise Fail(SOURCE, f"source.list did not return JSON: {redact(url)}", ["facts guide contract"])
+        if not isinstance(page, dict) or not isinstance(page.get("objects"), list):
+            raise Fail(SOURCE, "source.list must return {\"objects\": [{\"key\", \"size\"}], \"cursor\"?}", ["facts guide contract"])
+        objects += [{"key": o["key"], "size": o.get("size")} for o in page["objects"] if isinstance(o, dict) and o.get("key")]
+        cursor = page.get("cursor")
+        if not cursor:
+            return sorted(objects, key=lambda o: o["key"])
+
+
+def raw_path(c: Contract, key: str) -> Path:
+    clean = "/".join(p for p in key.split("/") if p not in ("", ".", ".."))
+    return c.cache / "raw" / clean
+
+
+def download(c: Contract, tok: str | None, obj: dict) -> Path:
+    if obj.get("path"):
+        return obj["path"]
+    path = raw_path(c, obj["key"])
+    if path.exists() and (obj.get("size") is None or path.stat().st_size == obj["size"]):
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = fetch(c.source["get"].replace("{key}", urllib.parse.quote(obj["key"], safe="")), tok)
+    part = path.with_name(path.name + ".part")
+    part.write_bytes(body)
+    os.replace(part, path)
+    return path
+
+
+# ---------------------------------------------------------------- sync
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS facts_all (object VARCHAR, kind VARCHAR, t DOUBLE, ts TIMESTAMP, session VARCHAR,
+  segment DOUBLE, build VARCHAR, actor VARCHAR, target VARCHAR, who VARCHAR, data JSON);
+CREATE TABLE IF NOT EXISTS restarts (session VARCHAR, t DOUBLE);
+CREATE TABLE IF NOT EXISTS objects (key VARCHAR PRIMARY KEY, size BIGINT, lines BIGINT, bad_lines BIGINT,
+  facts BIGINT, ingested_at TIMESTAMP, error VARCHAR);
+CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR);
+"""
+
+
+def validate_mapping(c: Contract) -> None:
+    import duckdb
+    con = duckdb.connect()
+    for name in DEFAULT_FIELDS:
+        try:
+            con.execute(f"SELECT {c.expr(name)} FROM (SELECT '{{}}'::JSON AS json)").fetchall()
+        except Exception as e:
+            raise Fail(CONTRACT, f"fields.{name} in facts.md is not a valid expression: {str(e).splitlines()[0]}",
+                       ["facts guide contract"])
+    if c.restart_sql:
+        try:
+            con.execute("SELECT count(*) FROM (SELECT NULL::VARCHAR AS kind, NULL::DOUBLE AS t, NULL::VARCHAR AS session, "
+                        "NULL::VARCHAR AS build, NULL::VARCHAR AS actor, NULL::VARCHAR AS target, NULL::VARCHAR AS who, "
+                        f"'{{}}'::JSON AS data) WHERE ({c.restart_sql})").fetchall()
+        except Exception as e:
+            raise Fail(CONTRACT, f"restart_sql in facts.md is not a valid condition: {str(e).splitlines()[0]}",
+                       ["facts guide contract"])
+
+
+def ingest(con, c: Contract, key: str, path: Path, size) -> dict:
+    con.execute("BEGIN")
+    try:
+        con.execute("DROP TABLE IF EXISTS stage")
+        con.execute(f"CREATE TEMP TABLE stage AS SELECT json FROM read_json_objects({q(str(path))}, "
+                    "format='newline_delimited', ignore_errors=true, maximum_object_size=268435456)")
+        lines, bad = con.execute("SELECT count(*), count(*) FILTER (json IS NULL) FROM stage").fetchone()
+        e = c.expr
+        con.execute("DROP TABLE IF EXISTS stage2")
+        con.execute(f"""CREATE TEMP TABLE stage2 AS SELECT CAST({e('kind')} AS VARCHAR) AS kind, TRY_CAST({e('t')} AS DOUBLE) AS t,
+            CAST({e('session')} AS VARCHAR) AS session, CAST({e('build')} AS VARCHAR) AS build,
+            CAST({e('actor')} AS VARCHAR) AS actor, CAST({e('target')} AS VARCHAR) AS target,
+            lower(CAST({e('who')} AS VARCHAR)) AS who, json AS data FROM stage WHERE json IS NOT NULL""")
+        if c.restart_sql:  # actor numbers restart here: later facts belong to a new segment of the session
+            con.execute(f"""INSERT INTO restarts SELECT DISTINCT session, t FROM stage2
+                WHERE session IS NOT NULL AND t IS NOT NULL AND ({c.restart_sql})""")
+        con.execute("""INSERT INTO facts_all SELECT ?, s.kind, s.t,
+            CASE WHEN s.t BETWEEN -1e15 AND 1e15 THEN make_timestamp(CAST(s.t * 1000 AS BIGINT)) END,
+            s.session, coalesce(r.t, 0), s.build, s.actor, s.target, s.who, s.data
+            FROM stage2 s ASOF LEFT JOIN restarts r ON s.session = r.session AND s.t >= r.t""", [key])
+        con.execute("DELETE FROM objects WHERE key = ?", [key])
+        con.execute("INSERT INTO objects VALUES (?, ?, ?, ?, ?, now(), NULL)", [key, size, lines, bad, lines - bad])
+        con.execute("DROP TABLE stage; DROP TABLE stage2")
+        con.execute("COMMIT")
+        return {"lines": lines, "bad": bad}
+    except Exception as ex:
+        con.execute("ROLLBACK")
+        message = str(ex).splitlines()[0][:300]
+        con.execute("DELETE FROM objects WHERE key = ?", [key])
+        con.execute("INSERT INTO objects VALUES (?, ?, NULL, NULL, NULL, now(), ?)", [key, size, message])
+        return {"error": message}
+
+
+def derive(con, c: Contract) -> None:
+    if c.restart_sql:
+        # Ingest assigns segments from the restarts it has seen so far, but objects flushed in the same second can arrive
+        # in any order, so recompute from the complete restarts table and rewrite only rows that change.
+        con.execute("""UPDATE facts_all SET segment = x.seg FROM (
+            SELECT f.rowid AS rid, coalesce(r.t, 0) AS seg FROM facts_all f
+            ASOF LEFT JOIN restarts r ON f.session = r.session AND f.t >= r.t) x
+            WHERE facts_all.rowid = x.rid AND facts_all.segment IS DISTINCT FROM x.seg""")
+    extra = ""
+    try:
+        if c.actor_sql:
+            cols = [d[0] for d in con.execute(f"SELECT * FROM ({c.actor_sql}) LIMIT 0").description]
+            segment = "segment" if "segment" in cols else "0"
+            extra = (f"UNION ALL SELECT CAST(session AS VARCHAR), CAST({segment} AS DOUBLE), CAST(actor AS VARCHAR), "
+                     f"lower(CAST(who AS VARCHAR)) FROM ({c.actor_sql})")
+        con.execute(f"""CREATE OR REPLACE TABLE actors AS
+            WITH seen AS (SELECT session, segment, actor, who FROM facts_all WHERE actor IS NOT NULL AND session IS NOT NULL {extra})
+            SELECT session, segment, actor,
+              CASE WHEN bool_or(who = 'agent') THEN 'agent' WHEN bool_or(who = 'human') THEN 'human'
+                   WHEN bool_or(who = 'bot') THEN 'bot' ELSE max(who) END AS class,
+              list(DISTINCT who ORDER BY who) FILTER (who IS NOT NULL) AS seen_as
+            FROM seen GROUP BY session, segment, actor""")
+    except Exception as e:
+        raise Fail(CONTRACT, f"actor_sql in facts.md failed: {str(e).splitlines()[0]}", ["facts guide contract"])
+    admin = ", ".join(q(k) for k in c.admin_kinds) or "''"
+    con.execute(f"""CREATE OR REPLACE TABLE sessions AS
+        WITH f AS (SELECT session, min(t) AS first_t, max(t) AS last_t, count(*) AS facts, count(DISTINCT segment) AS segments,
+                     list(DISTINCT build ORDER BY build) FILTER (build IS NOT NULL) AS builds,
+                     bool_or(kind IN ({admin})) AS admin
+                   FROM facts_all WHERE session IS NOT NULL GROUP BY session),
+             a AS (SELECT session, count(*) FILTER (class = 'human') AS humans, count(*) FILTER (class = 'bot') AS bots,
+                     count(*) FILTER (class = 'agent') AS agents FROM actors GROUP BY session)
+        SELECT f.session, f.first_t, f.last_t, make_timestamp(CAST(f.first_t * 1000 AS BIGINT)) AS started,
+               (f.last_t - f.first_t) / 3.6e6 AS hours, f.facts, f.segments, f.builds, f.admin,
+               coalesce(a.humans, 0) AS humans, coalesce(a.bots, 0) AS bots, coalesce(a.agents, 0) AS agents
+        FROM f LEFT JOIN a USING (session)""")
+
+
+@contextlib.contextmanager
+def sync_lock(c: Contract):
+    c.cache.mkdir(parents=True, exist_ok=True)
+    with open(c.cache / ".sync.lock", "w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Fail(BUSY, f"another `facts sync` is running for {c.name}; wait for it to finish")
+        yield
+
+
+def cmd_sync(args, c: Contract):
+    started = time.time()
+    with sync_lock(c):
+        validate_mapping(c)
+        tok = token(c) if c.source["kind"] == "http" else None
+        listed = list_source(c, tok)
+        con = open_db(c, write=True)
+        con.execute(SCHEMA)
+        mapping = c.mapping_hash()
+        changed = meta(con, "mapping") not in (None, mapping)
+        if changed and not args.rebuild:
+            log("the field mapping in facts.md changed since the last ingest; rebuilding from the local raw files")
+        rebuild = args.rebuild or changed
+        if rebuild:
+            con.execute("DROP TABLE IF EXISTS facts_all; DROP TABLE IF EXISTS objects; DROP TABLE IF EXISTS restarts;")
+            con.execute(SCHEMA)
+        done = {r[0] for r in con.execute("SELECT key FROM objects WHERE error IS NULL").fetchall()}
+        todo = [o for o in listed if o["key"] not in done]
+        pending = len(todo)
+        if args.limit:
+            todo = todo[: args.limit]
+        log(f"{len(listed)} objects at the source, {len(todo)} to ingest")
+        ingested = failed = lines = bad = 0
+        failures, last = [], time.time()
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            futures = [(o, pool.submit(download, c, tok, o)) for o in todo]
+            for i, (o, future) in enumerate(futures, 1):
+                try:
+                    path = future.result()
+                except Fail as e:
+                    if e.code == SOURCE and "rejected the token" in e.message:
+                        pool.shutdown(cancel_futures=True)
+                        raise
+                    result = {"error": e.message}
+                    con.execute("DELETE FROM objects WHERE key = ?", [o["key"]])
+                    con.execute("INSERT INTO objects VALUES (?, ?, NULL, NULL, NULL, now(), ?)", [o["key"], o.get("size"), e.message])
+                else:
+                    result = ingest(con, c, o["key"], path, o.get("size"))
+                if "error" in result:
+                    failed += 1
+                    failures.append({"key": o["key"], "error": result["error"]})
+                else:
+                    ingested += 1
+                    lines += result["lines"]
+                    bad += result["bad"]
+                if time.time() - last > 10 or i == len(futures):
+                    last = time.time()
+                    log(f"[{i}/{len(futures)}] {ingested} ingested, {failed} failed, {lines} lines")
+        derive(con, c)
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('mapping', ?), ('synced_at', ?), ('tool', ?)",
+                    [mapping, dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(), VERSION])
+        total = con.execute("SELECT count(*) FROM facts_all").fetchone()[0]
+        con.close()
+    data = {"source_objects": len(listed), "ingested": ingested, "failed": failed, "lines": lines, "bad_lines": bad,
+            "facts_total": total, "rebuilt": bool(rebuild), "seconds": round(time.time() - started, 1),
+            "failures": failures[:20], "remaining": pending - len(todo)}
+    nxt = ["facts", "facts check"]
+    if data["remaining"]:
+        nxt.insert(0, "facts sync")
+    if failed:
+        raise Fail(SOURCE, f"{failed} object(s) failed; the other {ingested} were ingested. Rerun `facts sync` to retry them.",
+                   ["facts sync", "facts check"], **data)
+    return data, nxt
+
+
+# ---------------------------------------------------------------- read commands
+
+def rows(con, sql: str, params=None) -> list[dict]:
+    cur = con.execute(sql, params or [])
+    names = [d[0] for d in cur.description]
+    types = [str(d[1]) for d in cur.description]
+    out = []
+    for row in cur.fetchall():
+        item = {}
+        for name, kind, value in zip(names, types, row):
+            if kind == "JSON" and isinstance(value, str):
+                with contextlib.suppress(json.JSONDecodeError):
+                    value = json.loads(value)
+            item[name] = plain(value)
+        out.append(item)
+    return out
+
+
+def scalar(con, sql: str, params=None):
+    return plain(con.execute(sql, params or []).fetchone()[0])
+
+
+def quick_warnings(con, c: Contract) -> list[dict]:
+    w = []
+    if meta(con, "mapping") != c.mapping_hash():
+        w.append({"id": "mapping-changed", "level": "warn", "about": "facts.md fields changed since the last ingest",
+                  "try": "facts sync --rebuild"})
+    for name, error in BROKEN_VIEWS.items():
+        w.append({"id": f"view:{name}", "level": "fail", "about": f"contract view `{name}` is broken: {error}"})
+    last_ingest = scalar(con, "SELECT max(ingested_at) FROM objects")
+    synced_at = meta(con, "synced_at")
+    if last_ingest and synced_at and last_ingest > synced_at.replace("+00:00", ""):
+        w.append({"id": "derive-stale", "level": "warn", "about": "the last sync stopped after ingesting but before rebuilding "
+                  "`sessions` and `actors` (killed?); they miss recent facts", "try": "facts sync"})
+    failed = scalar(con, "SELECT count(*) FROM objects WHERE error IS NOT NULL")
+    if failed:
+        w.append({"id": "sync-failures", "level": "fail", "about": f"{failed} archive object(s) failed to ingest", "try": "facts sync"})
+    bad = scalar(con, "SELECT coalesce(sum(bad_lines), 0) FROM objects")
+    if bad:
+        w.append({"id": "bad-lines", "level": "warn", "about": f"{bad} line(s) were not valid JSON", "try": "facts check"})
+    if c.fresh_hours:
+        age = scalar(con, "SELECT (epoch_ms(now()) - max(t)) / 3.6e6 FROM facts_all")
+        if age is None or age > float(c.fresh_hours):
+            w.append({"id": "stale", "level": "warn", "about": f"newest fact is {age and round(age, 1)} h old (fresh_hours {c.fresh_hours})",
+                      "try": "facts sync"})
+    return w
+
+
+def cmd_triage(args, c: Contract):
+    project = {"name": c.name, "contract": str(c.path), "cache": str(c.cache), "source": c.source.get("kind")}
+    try:
+        con = open_db(c)
+    except Fail as e:
+        if e.code != NOT_SYNCED:
+            raise
+        return {"project": project, "synced": False}, ["facts sync", "facts guide"]
+    totals = rows(con, """SELECT count(*) AS facts, min(t) AS first_t, max(t) AS last_t,
+        round((epoch_ms(now()) - max(t)) / 3.6e6, 1) AS newest_age_hours FROM facts_all""")[0]
+    totals["first"], totals["last"] = iso(totals.pop("first_t")), iso(totals.pop("last_t"))
+    sessions = rows(con, """SELECT count(*) AS total, count(*) FILTER (humans > 0) AS with_humans,
+        count(*) FILTER (admin) AS admin_touched, count(*) FILTER (agents > 0) AS with_agents,
+        count(*) FILTER (segments > 1) AS restarted FROM sessions""")[0]
+    if c.exposure and "exposure" not in BROKEN_VIEWS:
+        play = {r["who"]: r["hours"] for r in rows(con, "SELECT who, round(sum(hours), 2) AS hours FROM exposure GROUP BY who ORDER BY who")}
+        everything = {r["who"]: r["hours"] for r in rows(con, "SELECT who, round(sum(hours), 2) AS hours FROM exposure_all GROUP BY who ORDER BY who")}
+        play = {"in_facts": play, "including_admin_touched_sessions": everything,
+                "note": "summed per actor (two players for an hour = 2 h); from facts.md `exposure` (see `facts notes`)"}
+    else:
+        play = "declare `exposure` in facts.md to see hours of play by who"
+    kinds = rows(con, "SELECT kind, count(*) AS n FROM facts_all GROUP BY kind ORDER BY n DESC, kind LIMIT 15")
+    builds = rows(con, """SELECT build, count(*) AS facts, min(ts) AS first, max(ts) AS last FROM facts_all
+        WHERE build IS NOT NULL GROUP BY build ORDER BY max(t) DESC LIMIT 5""")
+    latest = rows(con, "SELECT session, started, round(hours, 2) AS hours, humans, bots, agents, admin FROM sessions ORDER BY last_t DESC LIMIT 3")
+    eras = c.eras()
+    data = {
+        "project": project, "synced": True, "synced_at": meta(con, "synced_at"),
+        "objects": scalar(con, "SELECT count(*) FROM objects"), **totals, "sessions": sessions,
+        "play_hours": play,
+        "kinds": kinds, "recent_builds": builds, "recent_sessions": latest,
+        "eras": {"count": len(eras), "latest": [e["id"] for e in eras[-3:]]},
+        "tables": {"facts": "default: excludes admin-touched sessions and test agents",
+                   "all_facts": "everything", "sessions": "one row per session",
+                   "actors": "one row per actor per session segment", "facts_all": "raw stored rows",
+                   **({"exposure": "hours of play per session and who (from facts.md)"} if c.exposure else {}),
+                   **{v: "contract view" for v in c.views}},
+        "warnings": quick_warnings(con, c),
+    }
+    top = kinds[0]["kind"] if kinds else "<kind>"
+    nxt = [f"facts schema {shell(str(top))}",
+           "facts query \"SELECT kind, who, count(*) AS n FROM facts GROUP BY ALL ORDER BY n DESC\"",
+           "facts check"]
+    if latest:
+        nxt.insert(1, f"facts session {shell(str(latest[0]['session']))}")
+    if len(eras) >= 2:
+        nxt.append(f"facts compare {shell(eras[-2]['id'])} {shell(eras[-1]['id'])}")
+    if any(w["id"] == "mapping-changed" for w in data["warnings"]):
+        nxt.insert(0, "facts sync --rebuild")
+    return data, nxt
+
+
+def cmd_schema(args, c: Contract):
+    con = open_db(c)
+    observed = {r["kind"]: r for r in rows(con, """SELECT kind, count(*) AS n, min(ts) AS first, max(ts) AS last
+        FROM facts_all GROUP BY kind ORDER BY kind""")}
+    if args.kind:
+        if args.kind not in observed and args.kind not in c.kinds:
+            near = difflib.get_close_matches(args.kind, list(observed) + list(c.kinds), n=5, cutoff=0.4)
+            raise Fail(USAGE, f"no kind {args.kind!r}", [f"facts schema {shell(k)}" for k in near] or ["facts schema"])
+        declared = c.kinds.get(args.kind) or {}
+        if isinstance(declared, str):
+            declared = {"about": declared}
+        keys = rows(con, """WITH s AS (SELECT data FROM facts_all WHERE kind = ? ORDER BY t DESC LIMIT 5000)
+            SELECT k AS field, count(*) AS present, round(count(*) / (SELECT count(*) FROM s), 3) AS share
+            FROM s, unnest(json_keys(data)) AS u(k) GROUP BY k ORDER BY present DESC, k""", [args.kind])
+        seen = {k["field"] for k in keys}
+        wanted = [str(f) for f in (declared.get("fields") or [])]
+        example = rows(con, "SELECT data FROM facts_all WHERE kind = ? ORDER BY t DESC LIMIT 1", [args.kind])
+        who = rows(con, "SELECT who, count(*) AS n FROM all_facts WHERE kind = ? GROUP BY who ORDER BY n DESC", [args.kind])
+        data = {"kind": args.kind, "about": declared.get("about"), "count": (observed.get(args.kind) or {}).get("n", 0),
+                "first": (observed.get(args.kind) or {}).get("first"), "last": (observed.get(args.kind) or {}).get("last"),
+                "by_who": who, "fields_observed": keys,
+                "declared_never_seen": sorted(set(wanted) - seen) if wanted else [],
+                "seen_not_declared": sorted(seen - set(wanted) - set(c.fields.values())) if wanted else [],
+                "example": example[0]["data"] if example else None}
+        return data, [f"facts query \"SELECT data FROM facts WHERE kind = '{args.kind}' ORDER BY t DESC LIMIT 5\""]
+    tables = rows(con, """SELECT table_name AS name, list(column_name || ' ' || data_type ORDER BY column_index) AS columns
+        FROM duckdb_columns() WHERE table_name IN (SELECT table_name FROM duckdb_tables() UNION SELECT view_name FROM duckdb_views() WHERE NOT internal)
+        AND table_name NOT IN ('stage', 'meta') GROUP BY table_name ORDER BY table_name""")
+    kinds = []
+    for name in sorted(set(observed) | set(c.kinds), key=lambda k: (k is None, str(k))):
+        declared = c.kinds.get(name)
+        about = declared if isinstance(declared, str) else (declared or {}).get("about")
+        o = observed.get(name) or {}
+        kinds.append({"kind": name, "n": o.get("n", 0), "declared": name in c.kinds, "about": about, "last": o.get("last")})
+    data = {"tables": tables, "kinds": kinds,
+            "undeclared_kinds": sorted(k for k in observed if k is not None and k not in c.kinds) if c.kinds else [],
+            "declared_never_seen": sorted(k for k in c.kinds if k not in observed),
+            "json": "facts store the whole raw fact in `data` (JSON): data->>'$.field' gives text, data->'$.field' gives JSON"}
+    return data, ["facts schema <kind>", "facts query \"SELECT ...\""]
+
+
+def cmd_query(args, c: Contract):
+    if args.file:
+        try:
+            args.sql = Path(args.file).expanduser().read_text()
+        except OSError as e:
+            raise Fail(USAGE, f"cannot read --file {args.file}: {e.strerror}")
+    elif args.sql in (None, "-"):
+        if args.sql is None and sys.stdin.isatty():
+            raise Fail(USAGE, "give SQL as an argument, with --file PATH, or on stdin with `-`",
+                       ["facts query \"SELECT kind, count(*) FROM facts GROUP BY kind\""])
+        args.sql = sys.stdin.read()
+    con = open_db(c)
+    sql = args.sql.strip().rstrip(";")
+    if not sql:
+        raise Fail(USAGE, "empty SQL", ["facts query \"SELECT kind, count(*) FROM facts GROUP BY kind\""])
+    limit = None if args.all else args.limit
+    try:
+        try:
+            cur = con.execute(f"SELECT * FROM ({sql}) AS q" + (f" LIMIT {limit + 1}" if limit else ""))
+        except Exception as e:
+            if "Parser Error" not in str(e):
+                raise
+            cur = con.execute(sql)
+        names = [d[0] for d in cur.description] if cur.description else []
+        types = [str(d[1]) for d in cur.description] if cur.description else []
+        fetched = cur.fetchmany(limit + 1) if limit else cur.fetchall()
+    except Fail:
+        raise
+    except Exception as e:
+        message = str(e).splitlines()[0]
+        hint = ["facts schema"]
+        if "read-only" in message:
+            message = "facts query is read-only; the local mirror is rebuilt only by `facts sync`. " + message
+        m = re.search(r'Parser Error: syntax error at or near "(\w+)"', message)
+        if m and re.search(rf"\s{re.escape(m.group(1))}\s*(,|FROM\b|$)", sql, re.I):
+            message += f' — if "{m.group(1)}" is a column alias it is an SQL keyword here: write AS "{m.group(1)}"'
+        if "Conversion Error" in message and re.search(r"\b(AND|OR|NOT)\s+[\w.]+\s*->>?", sql, re.I):
+            message += (" — after AND/OR/NOT, DuckDB binds a JSON arrow wrongly: write ... AND (data->>'$.x') = 'v',"
+                        " not ... AND data->>'$.x' = 'v'")
+            hint.insert(0, "facts guide  # see Querying")
+        raise Fail(USAGE, message, hint)
+    truncated = bool(limit) and len(fetched) > limit
+    fetched = fetched[:limit] if limit else fetched
+    out = []
+    for row in fetched:
+        item = {}
+        for name, kind, value in zip(names, types, row):
+            if kind == "JSON" and isinstance(value, str):
+                with contextlib.suppress(json.JSONDecodeError):
+                    value = json.loads(value)
+            item[name] = plain(value)
+        out.append(item)
+    data = {"columns": [{"name": n, "type": t} for n, t in zip(names, types)], "rows": out,
+            "row_count": len(out), "truncated": truncated}
+    again = f"facts query --file {shell(args.file)}" if args.file else f"facts query {shell(args.sql.strip())}"
+    nxt = [f"{again} --limit {limit * 5}"] if truncated else []
+    return data, nxt
+
+
+def cmd_session(args, c: Contract):
+    con = open_db(c)
+    matches = [r[0] for r in con.execute("SELECT session FROM sessions WHERE starts_with(session, ?) ORDER BY last_t DESC LIMIT 6",
+                                         [args.id]).fetchall()]
+    if len(matches) != 1:
+        if not matches:
+            recent = [r[0] for r in con.execute("SELECT session FROM sessions ORDER BY last_t DESC LIMIT 5").fetchall()]
+            raise Fail(USAGE, f"no session starts with {args.id!r}", [f"facts session {shell(s)}" for s in recent])
+        raise Fail(USAGE, f"{args.id!r} matches several sessions; give more of the id", [f"facts session {shell(s)}" for s in matches])
+    sid = matches[0]
+    summary = rows(con, "SELECT * FROM sessions WHERE session = ?", [sid])[0]
+    actors = rows(con, "SELECT segment, actor, class, seen_as FROM actors WHERE session = ? ORDER BY segment, class, actor", [sid])
+    kinds = [k.strip() for k in args.kinds.split(",")] if args.kinds else None
+    where, params = ["session = ?"], [sid]
+    if kinds:
+        where.append("kind IN (" + ", ".join("?" for _ in kinds) + ")")
+        params += kinds
+    elif c.bulky:
+        where.append("kind NOT IN (" + ", ".join("?" for _ in c.bulky) + ")")
+        params += c.bulky
+    if args.who:
+        where.append("who = ?")
+        params.append(args.who)
+    timeline = rows(con, f"""SELECT round(t - {summary['first_t']}) AS ms, kind, actor, who, target, target_who, data FROM all_facts
+        WHERE {' AND '.join(where)} ORDER BY t, kind LIMIT {args.limit + 1}""", params)
+    truncated = len(timeline) > args.limit
+    hidden = rows(con, f"""SELECT kind, count(*) AS n FROM facts_all WHERE session = ? AND kind IN ({', '.join(q(k) for k in c.bulky) or 'NULL'})
+        GROUP BY kind ORDER BY kind""", [sid]) if c.bulky and not kinds else []
+    data = {"session": summary, "actors": actors, "timeline": timeline[: args.limit], "truncated": truncated,
+            "omitted_bulky_kinds": hidden}
+    nxt = []
+    if truncated:
+        nxt.append(f"facts session {shell(sid)} --limit {args.limit * 4}")
+    for h in hidden[:2]:
+        nxt.append(f"facts session {shell(sid)} --kinds {shell(h['kind'])} --limit 20")
+    return data, nxt
+
+
+# ---------------------------------------------------------------- compare
+
+Z = 1.959964
+
+
+def poisson_ci(n: float) -> tuple[float, float]:
+    """95% interval for a Poisson count (Wilson–Hilferty)."""
+    lo = 0.0 if n <= 0 else n * (1 - 1 / (9 * n) - Z / (3 * math.sqrt(n))) ** 3
+    m = n + 1
+    hi = m * (1 - 1 / (9 * m) + Z / (3 * math.sqrt(m))) ** 3
+    return max(lo, 0.0), hi
+
+
+def wilson(k: float, n: float) -> tuple[float, float]:
+    if n <= 0:
+        return 0.0, 1.0
+    p = k / n
+    d = 1 + Z * Z / n
+    centre = (p + Z * Z / (2 * n)) / d
+    half = Z * math.sqrt(p * (1 - p) / n + Z * Z / (4 * n * n)) / d
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def resolve_era(spec: str, c: Contract) -> dict:
+    if spec.startswith("build:"):
+        builds = [b for b in spec[6:].split(",") if b]
+        return {"id": spec, "builds": builds, "from": None, "to": None}
+    if ".." in spec:
+        a, b = spec.split("..", 1)
+        return {"id": spec, "builds": None, "from": parse_time(a), "to": parse_time(b) if b else None}
+    eras = c.eras()
+    for e in eras:
+        if e["id"] == spec:
+            if e.get("environment") and c.environment and e["environment"] != c.environment:
+                same = [x["id"] for x in eras if x.get("environment") in (None, c.environment)][-4:]
+                raise Fail(USAGE, f"era {spec!r} is from {e['environment']}; this archive is {c.environment}",
+                           [f"facts compare {shell(same[-2])} {shell(same[-1])}"] if len(same) >= 2 else ["facts eras"])
+            build = e.get("build")
+            return {"id": spec, "builds": ([build] if isinstance(build, str) else build) or None,
+                    "from": parse_time(e.get("from")), "to": parse_time(e.get("to")),
+                    "environment": e.get("environment"), "change": e.get("change")}
+    near = difflib.get_close_matches(spec, [e["id"] for e in eras], n=5, cutoff=0.3)
+    raise Fail(USAGE, f"no era {spec!r} (eras come from facts.md `eras`; or use build:<name> or <from>..<to>)",
+               [f"facts compare {shell(n)} …" for n in near] or ["facts eras"])
+
+
+def parse_time(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        when = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise Fail(USAGE, f"cannot read time {value!r}; use ISO 8601 like 2026-10-06 or 2026-10-06T15:19:00Z")
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return when.timestamp() * 1000
+
+
+def era_where(era: dict) -> str:
+    parts = []
+    if era.get("from") is not None:
+        parts.append(f"t >= {era['from']}")
+    if era.get("to") is not None:
+        parts.append(f"t < {era['to']}")
+    if era.get("builds"):
+        parts.append("build IN (" + ", ".join(q(b) for b in era["builds"]) + ")")
+    return " AND ".join(parts) or "TRUE"
+
+
+def default_measures(con, a: dict, b: dict) -> dict:
+    kinds = [r[0] for r in con.execute(f"SELECT kind FROM facts WHERE ({era_where(a)}) OR ({era_where(b)}) GROUP BY kind "
+                                       "ORDER BY count(*) DESC, kind LIMIT 12").fetchall()]
+    return {f"{k}-per-session-hour": {
+        "about": f"`{k}` facts per session-hour (built-in first look; declare `measures` in facts.md for real ones)",
+        "rate": f"SELECT session, count(*) FILTER (kind = {q(k)}) AS n, (max(t) - min(t)) / 3.6e6 AS exposure "
+                "FROM era WHERE session IS NOT NULL GROUP BY session"} for k in kinds if k is not None}
+
+
+def define_era(con, c: Contract, era: dict) -> None:
+    con.execute(f"CREATE OR REPLACE TEMP VIEW era AS SELECT * FROM facts WHERE {era_where(era)}")
+    con.execute("CREATE OR REPLACE TEMP VIEW era_sessions AS SELECT session, (max(t) - min(t)) / 3.6e6 AS hours "
+                "FROM era WHERE session IS NOT NULL GROUP BY session")
+    if c.exposure:  # computed once per era, not once per measure
+        con.execute(f"CREATE OR REPLACE TEMP TABLE era_exposure AS WITH source AS (SELECT * FROM era) {c.exposure}")
+
+
+def measure_rows(con, m: dict) -> dict:
+    """A measure's rows: one per session (clustered) or a single total row."""
+    kind = "rate" if "rate" in m else "share" if "share" in m else None
+    if not kind:
+        return {"error": "a measure needs `rate:` (SQL giving n, exposure) or `share:` (SQL giving k, n), optionally per session"}
+    try:
+        got = rows(con, m[kind])
+    except Exception as e:
+        return {"error": str(e).splitlines()[0]}
+    a, b = ("n", "exposure") if kind == "rate" else ("k", "n")
+    if got and (a not in got[0] or b not in got[0]):
+        return {"error": f"a {kind} measure's SQL must return columns {a} and {b} (got {list(got[0])})"}
+    pairs = [(float(r.get(a) or 0), float(r.get(b) or 0)) for r in got]
+    return {"type": kind, "clustered": bool(got) and "session" in got[0], "pairs": pairs}
+
+
+def bootstrap(pairs: list, seed: int, draws: int = 2000) -> list[float]:
+    """Ratio of sums over sessions resampled with replacement (a clustered interval)."""
+    import random
+    rng, out = random.Random(seed), []
+    k = len(pairs)
+    for _ in range(draws):
+        num = den = 0.0
+        for _ in range(k):
+            x, y = pairs[rng.randrange(k)]
+            num += x
+            den += y
+        if den:
+            out.append(num / den)
+    return out  # unsorted: the difference pairs independent draws of the two eras
+
+
+def pct(values: list[float], p: float):
+    return values[min(len(values) - 1, max(0, int(p * len(values))))] if values else None
+
+
+def summarise(m: dict, measure: dict, c: Contract, seed: int) -> dict:
+    per = measure.get("per", "hour")
+    num = sum(x for x, _ in m["pairs"])
+    den = sum(y for _, y in m["pairs"])
+    value = num / den if den else None
+    side = {"value": value if value is None else round(value, 4)}
+    if m["type"] == "rate":
+        side.update(n=round(num, 3), exposure=round(den, 3), unit=f"per {per}")
+        min_exposure = float(c.minimums["exposure_hours"]) * (60 if per == "minute" else 1)
+        enough = num >= c.minimums["events"] and den >= min_exposure
+    else:
+        side.update(k=round(num, 3), n=round(den, 3))
+        enough = den >= c.minimums["events"]
+    if m["clustered"]:
+        sessions = sum(1 for _, y in m["pairs"] if y)
+        draws = bootstrap(m["pairs"], seed)
+        ordered = sorted(draws)
+        side.update(sessions=sessions, low=pct(ordered, 0.025), high=pct(ordered, 0.975), _draws=draws)
+        enough = enough and sessions >= int(c.minimums["sessions"])
+    elif m["type"] == "rate":
+        lo, hi = poisson_ci(num)
+        side.update(low=lo / den if den else None, high=hi / den if den else None)
+    else:
+        lo, hi = wilson(num, den)
+        side.update(low=lo, high=hi)
+    for key in ("low", "high"):
+        if side.get(key) is not None:
+            side[key] = round(side[key], 4)
+    side["enough"] = enough
+    return side
+
+
+def cmd_compare(args, c: Contract):
+    con = open_db(c)
+    a, b = resolve_era(args.a, c), resolve_era(args.b, c)
+    measures = c.measures or default_measures(con, a, b)
+    unknown = [n for n in (args.measure or []) if n not in measures]
+    if unknown:
+        near = difflib.get_close_matches(unknown[0], list(measures), n=4, cutoff=0.3)
+        raise Fail(USAGE, f"no measure {unknown[0]!r}", [f"facts compare {shell(args.a)} {shell(args.b)} --measure {shell(n)}"
+                                                          for n in near] or ["facts measures"])
+    wanted = args.measure or list(measures)
+    got = {}
+    for era in (a, b):
+        define_era(con, c, era)
+        got[era["id"]] = {name: measure_rows(con, measures[name]) for name in wanted}
+    results = []
+    for name in wanted:
+        import zlib
+        ma, mb = got[a["id"]][name], got[b["id"]][name]
+        measure = measures[name] if isinstance(measures[name], dict) else {}
+        row = {"measure": name, "about": measure.get("about")}
+        if measure.get("counts"):
+            row["counts"] = measure["counts"]
+        if "error" in ma or "error" in mb:
+            row.update(verdict="error", error=ma.get("error") or mb.get("error"))
+            results.append(row)
+            continue
+        seed = zlib.crc32(name.encode())
+        sa, sb = summarise(ma, measure, c, seed), summarise(mb, measure, c, seed + 1)
+        clustered = ma["clustered"] and mb["clustered"]
+        if clustered:
+            da, db = sa.pop("_draws"), sb.pop("_draws")
+            diffs = sorted(y - x for x, y in zip(da, db)) if da and db else []
+            row["difference"] = {"of": f"B − A ({b['id']} minus {a['id']})",
+                                 "value": None if sa["value"] is None or sb["value"] is None else round(sb["value"] - sa["value"], 4),
+                                 "low": pct(diffs, 0.025), "high": pct(diffs, 0.975)}
+        else:
+            sa.pop("_draws", None), sb.pop("_draws", None)
+        if not (sa["enough"] and sb["enough"]):
+            verdict = "not enough data"
+        elif clustered and row["difference"]["low"] is not None and row["difference"]["low"] > 0:
+            verdict = "up"
+        elif clustered and row["difference"]["high"] is not None and row["difference"]["high"] < 0:
+            verdict = "down"
+        elif not clustered and sb["low"] is not None and sa["high"] is not None and sb["low"] > sa["high"]:
+            verdict = "up"
+        elif not clustered and sb["high"] is not None and sa["low"] is not None and sb["high"] < sa["low"]:
+            verdict = "down"
+        else:
+            verdict = "no clear change"
+        row.update(a=sa, b=sb, verdict=verdict, clustered=clustered)
+        if not clustered:
+            row["note"] = ("interval assumes independent events; return a `session` column from the measure's SQL for an "
+                           "interval that resamples whole sessions")
+        results.append(row)
+    data = {"a": a, "b": b, "minimums": c.minimums, "results": results,
+            "rule": "clustered measures: up/down only when the 95% bootstrap interval of the difference (whole sessions "
+                    "resampled) excludes zero; others: when the 95% intervals do not overlap. Both sides must meet the "
+                    "minimums (events, exposure, sessions). Rows come from `facts`: admin-touched sessions and test agents "
+                    "are excluded",
+            "evidence": {"a_where": era_where(a), "b_where": era_where(b)}}
+    return data, ["facts measures  # the SQL behind each measure"]
+
+
+def cmd_measures(args, c: Contract):
+    out = []
+    for name, m in c.measures.items():
+        m = m if isinstance(m, dict) else {}
+        kind = "rate" if "rate" in m else "share" if "share" in m else None
+        out.append({"measure": name, "type": kind, "about": m.get("about"), "per": m.get("per", "hour") if kind == "rate" else None,
+                    "counts": m.get("counts"), "sql": m.get(kind) if kind else None})
+    data = {"measures": out, "views_in_measures": ["era (facts in the era)", "era_sessions (session, hours)"]
+            + (["era_exposure (facts.md exposure, over the era)"] if c.exposure else []),
+            "minimums": c.minimums}
+    if not out:
+        data["note"] = "no measures in facts.md: `facts compare` falls back to per-kind rates per session-hour"
+    return data, ["facts compare A B --measure NAME"]
+
+
+def cmd_eras(args, c: Contract):
+    eras = c.eras()
+    here = lambda e: not (e.get("environment") and c.environment and e["environment"] != c.environment)
+    out = [{"id": e["id"], "comparable": here(e), "from": e.get("from"), "to": e.get("to"), "build": e.get("build"),
+            "environment": e.get("environment"), "baseline": e.get("baseline"), "change": e.get("change")} for e in eras]
+    usable = [e for e in eras if here(e)]
+    nxt = [f"facts compare {shell(e.get('baseline') or usable[-2]['id'])} {shell(e['id'])}" for e in usable[-1:]] if len(usable) >= 2 else []
+    return {"environment": c.environment, "comparable": len(usable), "eras": out}, nxt
+
+
+# ---------------------------------------------------------------- check
+
+def cmd_check(args, c: Contract):
+    con = open_db(c)
+    found = []
+
+    def add(id_, level, about, value=None, evidence=None, sample=None):
+        item = {"id": id_, "level": level, "about": about}
+        if value is not None:
+            item["value"] = value
+        if evidence:
+            item["evidence"] = evidence
+        if sample:
+            item["sample"] = sample
+        found.append(item)
+
+    for w in quick_warnings(con, c):
+        add(w["id"], w["level"], w["about"], evidence=w.get("try"))
+    total = scalar(con, "SELECT count(*) FROM facts_all") or 0
+    lines = scalar(con, "SELECT coalesce(sum(lines), 0) FROM objects") or 0
+    bad = scalar(con, "SELECT coalesce(sum(bad_lines), 0) FROM objects") or 0
+    if bad and lines and bad / lines > 0.001:
+        add("bad-lines-share", "fail", "more than 0.1% of archived lines are not valid JSON", round(bad / lines, 5),
+            "facts query \"SELECT key, lines, bad_lines FROM objects WHERE bad_lines > 0 ORDER BY bad_lines DESC\"")
+    for field in ("kind", "t"):
+        n = scalar(con, f"SELECT count(*) FROM facts_all WHERE {field} IS NULL")
+        add(f"missing-{field}", "fail" if n else "ok", f"facts with no `{field}` ({c.fields[field]})", n,
+            f"facts query \"SELECT object, data FROM facts_all WHERE {field} IS NULL LIMIT 20\"" if n else None)
+    skip = f"AND kind NOT IN ({', '.join(q(k) for k in c.sessionless)})" if c.sessionless else ""  # never NOT IN (NULL)
+    for field in ("session", "build"):
+        n = scalar(con, f"SELECT count(*) FROM facts_all WHERE {field} IS NULL {skip}")
+        missing = rows(con, f"""SELECT kind, count(*) AS n, min(ts) AS first, max(ts) AS last FROM facts_all
+            WHERE {field} IS NULL {skip} GROUP BY kind ORDER BY n DESC LIMIT 8""")
+        share = round(n / total, 4) if total else 0
+        add(f"missing-{field}", "warn" if share > 0.01 else "ok",
+            f"facts with no `{field}` ({c.fields[field]}), excluding sessionless kinds", share,
+            sample=missing or None)
+    implausible = scalar(con, f"SELECT count(*) FROM facts_all WHERE t < 946684800000 OR t > epoch_ms(now()) + 86400000")
+    add("implausible-time", "fail" if implausible else "ok",
+        "facts timed before 2000 or more than a day in the future (seconds instead of ms?)", implausible,
+        "facts query \"SELECT object, t, kind FROM facts_all WHERE t < 946684800000 OR t > epoch_ms(now()) + 86400000 LIMIT 20\"" if implausible else None)
+    if c.kinds:
+        observed = {r[0] for r in con.execute("SELECT DISTINCT kind FROM facts_all").fetchall()}
+        undeclared = sorted(k for k in observed if k is not None and k not in c.kinds)
+        never = sorted(k for k in c.kinds if k not in observed)
+        add("undeclared-kinds", "warn" if undeclared else "ok", "kinds recorded but not listed in facts.md `kinds`", undeclared)
+        add("declared-never-seen", "warn" if never else "ok", "kinds listed in facts.md but never recorded", never)
+    conflicts = scalar(con, "SELECT count(*) FROM actors WHERE len(seen_as) > 1 AND list_contains(seen_as, 'agent')")
+    add("agent-conflicts", "warn" if conflicts else "ok", "actors recorded as a test agent and as something else in one session",
+        conflicts, "facts query \"SELECT * FROM actors WHERE len(seen_as) > 1\"" if conflicts else None)
+    eras = [e for e in c.eras() if not (e.get("environment") and c.environment and e["environment"] != c.environment)]
+    if eras:
+        builds = rows(con, "SELECT build, min(t) AS first_t, count(*) AS n FROM facts_all WHERE build IS NOT NULL GROUP BY build ORDER BY first_t")
+        def covered(b):
+            for e in eras:
+                listed = [e["build"]] if isinstance(e.get("build"), str) else (e.get("build") or [])
+                if b["build"] in listed:
+                    return True
+                lo, hi = parse_time(e.get("from")), parse_time(e.get("to"))
+                if not listed and lo is not None and b["first_t"] >= lo and (hi is None or b["first_t"] < hi):
+                    return True
+            return False
+        orphans = [b["build"] for b in builds if not covered(b)]
+        add("builds-without-era", "warn" if orphans else "ok",
+            "builds in the data that no era covers: add them to facts.md eras so comparisons can name them", orphans[-10:])
+    reused = scalar(con, "SELECT count(*) FROM actors WHERE list_contains(seen_as, 'human') AND list_contains(seen_as, 'bot')")
+    add("actor-reused", "warn" if reused else "ok",
+        "actor ids recorded as both human and bot in one session: the id was reused for different players, so per-actor "
+        "analysis of that session is unreliable", reused,
+        "facts query \"SELECT * FROM actors WHERE list_contains(seen_as, 'human') AND list_contains(seen_as, 'bot')\"" if reused else None)
+    excl = rows(con, """SELECT count(*) FILTER (admin) AS admin_touched_sessions, count(*) FILTER (agents > 0) AS sessions_with_agents,
+        count(*) AS sessions FROM sessions""")[0]
+    add("exclusions", "info", "sessions the default `facts` view leaves out (admin-touched) or trims (test agents)", excl)
+    volume = rows(con, """SELECT CAST(CAST(f.first AS DATE) AS VARCHAR) AS day, count(*) AS objects, round(sum(o.size) / 1e6, 2) AS mb
+        FROM objects o JOIN (SELECT object, min(ts) AS first FROM facts_all GROUP BY object) f ON f.object = o.key
+        WHERE o.error IS NULL AND f.first IS NOT NULL GROUP BY 1 ORDER BY 1 DESC LIMIT 14""")
+    per_day = c.budget.get("archive_mb_per_day")
+    over = [v for v in volume if per_day and v["mb"] and v["mb"] > float(per_day)]
+    add("archive-volume", "warn" if over else "info",
+        "compressed archive MB per day (last 14 days with data)" + (f"; budget {per_day} MB/day" if per_day else ""), volume)
+    for name, spec in c.checks.items():
+        spec = spec if isinstance(spec, dict) else {"sql": spec}
+        level = spec.get("level", "warn")
+        try:
+            sample = rows(con, f"SELECT * FROM ({spec['sql']}) LIMIT 5")
+            n = scalar(con, f"SELECT count(*) FROM ({spec['sql']})")
+            add(f"check:{name}", level if n else "ok", spec.get("about") or name, n,
+                f"facts query {shell(spec['sql'])}" if n else None, sample or None)
+        except Exception as e:
+            add(f"check:{name}", "fail", f"custom check `{name}` failed to run: {str(e).splitlines()[0]}")
+    order = {"fail": 0, "warn": 1, "info": 2, "ok": 3}
+    found.sort(key=lambda f: (order.get(f["level"], 9), f["id"]))
+    summary = {lvl: sum(1 for f in found if f["level"] == lvl) for lvl in ("fail", "warn", "info", "ok")}
+    data = {"summary": summary, "facts": total, "findings": found}
+    if summary["fail"] or (args.strict and summary["warn"]):
+        raise Fail(CHECK_FAILED, f"check found {summary['fail']} fail and {summary['warn']} warn finding(s)", [], **data)
+    return data, []
+
+
+# ---------------------------------------------------------------- init, capabilities, guide
+
+def cmd_notes(args, c: Contract):
+    body = re.sub(r"^---\s*\n.*?\n---\s*\n?", "", c.path.read_text(), count=1, flags=re.S).strip()
+    sql = {k: v for k, v in (("exposure", c.exposure), ("restart_sql", c.restart_sql), ("actor_sql", c.actor_sql)) if v}
+    return {"contract": str(c.path), "notes": body, "fields": c.fields, "sql": sql, "views": c.views,
+            "admin_kinds": c.admin_kinds, "minimums": c.minimums}, ["facts measures", "facts schema"]
+
+
+def cmd_init(args, c=None):
+    target = Path(args.project or os.getcwd()).resolve() / "facts.md"
+    if target.exists():
+        raise Fail(USAGE, f"{target} already exists; edit it instead (init never overwrites)", ["facts"])
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.name or ""):
+        raise Fail(USAGE, "give the app a lowercase name", ["facts init --name my-app"])
+    text = TEMPLATE.read_text().replace("name: my-app", f"name: {args.name}")
+    target.write_text(text)
+    return {"written": str(target)}, ["$EDITOR facts.md  # set source, fields and kinds", "facts sync"]
+
+
+COMMANDS = {
+    "(none)": "triage: what data exists, freshness, sessions, kinds, builds, eras, warnings and next commands",
+    "sync": "download new archive objects and ingest them [--rebuild] [--limit N] [--concurrency N]",
+    "schema": "tables, columns and kinds (declared vs recorded); `schema KIND` shows its fields and an example",
+    "query": "read-only SQL over the local mirror: facts query \"SQL\" | --file PATH | - (stdin) [--limit N] [--all] [--table]",
+    "session": "one session's summary, actors and timeline: facts session ID [--kinds a,b] [--who human] [--limit N]",
+    "eras": "the eras listed in facts.md",
+    "compare": "compare two eras with 95% intervals: facts compare A B [--measure NAME] (A/B: era id, build:NAME, FROM..TO)",
+    "measures": "the measures facts.md declares for compare, with their SQL",
+    "notes": "what facts.md says about this data (known bugs, what a session is) plus its field mapping and SQL",
+    "check": "data-quality audit; exit 5 on a fail finding [--strict: also on warn]",
+    "init": "write a starting facts.md here: facts init --name APP",
+    "capabilities": "this contract as JSON",
+    "guide": "the agent handbook (`guide contract` for the facts.md format)",
+}
+
+
+def cmd_capabilities(args, c=None):
+    return {"tool": "facts", "version": VERSION, "contract_version": CONTRACT_VERSION, "commands": COMMANDS,
+            "exit_codes": EXIT_CODES, "env": {"FACTS_CACHE": "override the local cache directory",
+                                               "FACTS_MEMORY": "DuckDB memory limit, e.g. 4GB (default: a quarter of RAM; sync spills to the cache)",
+                                               "FACTS_CONTRACT": "path to facts.md (else searched upward from --project or cwd)"},
+            "global_flags": {"--project DIR": "where to look for facts.md", "--contract FILE": "use this facts.md"},
+            "output": {"stdout": "one JSON document: {ok, command, data, next, warnings?} or {ok: false, error}",
+                       "stderr": "progress and diagnostics only", "--table": "query/session rows as text for people"},
+            "tables": {"facts": "default view; excludes admin-touched sessions and test-agent facts",
+                       "all_facts": "every fact, with who resolved", "facts_all": "raw stored rows",
+                       "sessions": "session, first_t, last_t, started, hours, facts, segments, builds, admin, humans, bots, agents",
+                       "actors": "session, segment, actor, class, seen_as", "objects": "archive objects ingested, with line counts and errors",
+                       "exposure": "session, who, hours of play (if facts.md declares exposure)"}}, ["facts guide"]
+
+
+GUIDE = """# facts — agent handbook
+
+`facts` reads one app's recorded facts. The app's `facts.md` (found upward from the current
+directory) says where the archive is and how to read it. Data is mirrored into a local DuckDB file;
+nothing here can change production.
+
+## Start
+    facts                 # triage: freshness, sessions, kinds, builds, warnings, next commands
+    facts sync            # fetch new archive objects (resumable; run on the build host)
+    facts schema          # tables, columns, kinds; `facts schema KIND` for fields + example
+    facts check           # data-quality audit
+    facts notes           # what facts.md says: known recorder bugs, what a session is, the SQL behind views
+
+## What the words mean
+- session: the app's episode, as facts.md maps it (Rat Detective: a round). The facts.md body says more.
+- actor: who did it, numbered per session. target: the other party (a victim), if the fact has one.
+  On a death: actor/who is the killer, target/target_who the victim.
+- who / target_who: their class: human, bot, agent (a test browser) or system.
+- segment: if facts.md has `restart_sql`, actor numbers restart inside a session at those facts; actors are keyed
+  by (session, segment, actor), so who/target_who stay right across restarts.
+
+## Tables
+- `facts`      default. Leaves out admin-touched sessions and test-agent facts. Use this for analysis.
+- `all_facts`  everything (adds `admin_session`). Use only to study exclusions themselves.
+- `facts_all`  raw stored rows (no who resolution, no exclusions).
+- `sessions`   one row per session: started, hours (first to last fact, idle time included), facts, segments,
+               builds, admin, humans, bots, agents (actor counts, not people).
+- `actors`     one row per actor per session segment: class and every label seen.
+- `exposure`   hours of actual play per session and who, if facts.md declares it. Use it for "how much play".
+- contract views (listed by `facts`) are built on `facts` unless their SQL says otherwise.
+Columns: kind, t (epoch ms), ts (UTC timestamp), day, session, segment, build, actor, target, who, target_who,
+object, data (the raw fact as JSON).
+
+## Querying
+    facts query "SELECT kind, who, count(*) n FROM facts GROUP BY ALL ORDER BY n DESC"
+    facts query "SELECT data->>'$.cause' AS cause, count(*) FROM facts WHERE kind = 'death' GROUP BY 1"
+    facts query "SELECT count(*) FROM facts WHERE kind = 'death' AND (data->>'$.cause') = 'headshot'"
+    facts query "SELECT * FROM sessions WHERE humans > 0 ORDER BY started DESC" --limit 20
+DuckDB SQL. `data->>'$.x'` is text, `data->'$.x'` is JSON, `unnest(json_extract(data, '$.list[*]'))` expands a list.
+Always put a JSON arrow in parentheses inside AND/OR/NOT or arithmetic: ... AND (data->>'$.hp')::INT < 2.
+Results are capped at --limit (200); `truncated: true` means there is more. Queries are read-only.
+Long SQL or SQL sent over ssh: `facts query --file q.sql`, or `facts query - < q.sql`.
+
+## Comparing eras
+    facts eras
+    facts compare ERA_A ERA_B             # measures from facts.md, else per-kind rates per session-hour
+    facts compare build:B1 build:B2       # or time ranges: 2026-10-01..2026-10-06
+    facts measures                        # each measure's SQL
+A measure whose SQL returns a `session` column is clustered: its interval resamples whole sessions, which is
+honest when events bunch up within sessions. Others assume independent events and say so in a note.
+A verdict is `up`/`down` only when the interval of the difference excludes zero (clustered) or the two
+intervals separate, and both sides meet the minimums (events, exposure, sessions); otherwise
+`no clear change` or `not enough data`. Never report a bare number as a change.
+
+## Reading results honestly
+- Humans first: report human numbers apart from bots and test agents.
+- A session with an admin action is not ordinary play; `facts` already leaves it out.
+- Say how much data a claim rests on (events, hours) and its era/build.
+
+## Exit codes
+0 ok · 1 usage (the error names the fix) · 2 facts.md missing/invalid · 3 not synced (`facts sync`)
+· 4 source failure (rerun resumes) · 5 check failed · 6 busy (a sync is running)
+
+Every run prints one JSON document on stdout: {ok, command, data, next}. Errors: {ok: false, error: {code, message, try}}.
+`facts capabilities` gives this as JSON. `facts guide contract` explains facts.md.
+"""
+
+
+def cmd_guide(args, c=None):
+    if args.topic == "contract":
+        text = (SKILL_DIR / "references" / "contract.md").read_text()
+    elif args.topic:
+        raise Fail(USAGE, f"no guide topic {args.topic!r}", ["facts guide", "facts guide contract"])
+    else:
+        text = GUIDE
+    return {"text": text}, []
+
+
+# ---------------------------------------------------------------- cli
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        words = sys.argv[1:]
+        m = re.search(r"invalid choice: '([^']+)'", message)
+        if m:
+            near = difflib.get_close_matches(m.group(1), [k for k in COMMANDS if k != "(none)"], n=3, cutoff=0.4)
+            raise Fail(USAGE, f"unknown command {m.group(1)!r}", [f"facts {n}" for n in near] or ["facts guide"])
+        m = re.search(r"unrecognized arguments: (.+)", message)
+        if m:
+            bad = m.group(1).split()[0]
+            flags = [a for action in self._all_actions() for a in action.option_strings]
+            near = difflib.get_close_matches(bad.split("=")[0], flags, n=3, cutoff=0.5)
+            fixed = [" ".join(["facts", *[(n if w == bad else w) for w in words]]) for n in near]
+            raise Fail(USAGE, f"unknown flag {bad!r}", fixed or ["facts capabilities"])
+        sub = next((w for w in words if w in COMMANDS), None)
+        raise Fail(USAGE, message, [f"facts {sub}: {COMMANDS[sub]}"] if sub else ["facts capabilities", "facts guide"])
+
+    def _all_actions(self):
+        actions = list(self._actions)
+        for action in self._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for sub in action.choices.values():
+                    actions += sub._actions
+        return actions
+
+
+def h(command: str) -> str:
+    return COMMANDS[command].replace("%", "%%")  # argparse formats help strings with %
+
+
+def build_parser() -> Parser:
+    p = Parser(prog="facts", description="Read an app's recorded facts (agent-first). Run `facts guide`.", add_help=True)
+    p.add_argument("--project", help="directory to search upward from for facts.md")
+    p.add_argument("--contract", help="path to facts.md")
+    p.add_argument("--version", action="version", version=f"facts {VERSION}")
+    sub = p.add_subparsers(dest="command", parser_class=Parser)
+    s = sub.add_parser("sync", help=h("sync"))
+    s.add_argument("--rebuild", action="store_true", help="re-ingest every object (after changing fields in facts.md)")
+    s.add_argument("--limit", type=int, default=0, help="ingest at most N new objects this run")
+    s.add_argument("--concurrency", type=int, default=6)
+    s = sub.add_parser("schema", help=h("schema"))
+    s.add_argument("kind", nargs="?")
+    s = sub.add_parser("query", aliases=["sql"], help=h("query"))
+    s.add_argument("sql", nargs="?", help="the SQL, or - to read it from stdin")
+    s.add_argument("--file", help="read the SQL from this file")
+    s.add_argument("--limit", type=int, default=200)
+    s.add_argument("--all", action="store_true", help="no row cap")
+    s.add_argument("--table", action="store_true", help="text table for people")
+    s = sub.add_parser("session", help=h("session"))
+    s.add_argument("id")
+    s.add_argument("--kinds")
+    s.add_argument("--who", choices=WHO)
+    s.add_argument("--limit", type=int, default=300)
+    s.add_argument("--table", action="store_true")
+    sub.add_parser("eras", help=h("eras"))
+    sub.add_parser("measures", help=h("measures"))
+    sub.add_parser("notes", help=h("notes"))
+    s = sub.add_parser("compare", help=h("compare"))
+    s.add_argument("a")
+    s.add_argument("b")
+    s.add_argument("--measure", action="append")
+    s = sub.add_parser("check", help=h("check"))
+    s.add_argument("--strict", action="store_true")
+    s = sub.add_parser("init", help=h("init"))
+    s.add_argument("--name", required=True)
+    sub.add_parser("capabilities", help=h("capabilities"))
+    s = sub.add_parser("guide", aliases=["help", "robot-docs"], help=h("guide"))
+    s.add_argument("topic", nargs="?")
+    return p
+
+
+HANDLERS = {None: cmd_triage, "sync": cmd_sync, "schema": cmd_schema, "query": cmd_query, "sql": cmd_query,
+            "session": cmd_session, "eras": cmd_eras, "measures": cmd_measures, "notes": cmd_notes, "compare": cmd_compare, "check": cmd_check, "init": cmd_init,
+            "capabilities": cmd_capabilities, "guide": cmd_guide, "help": cmd_guide, "robot-docs": cmd_guide}
+NO_CONTRACT = {"init", "capabilities", "guide", "help", "robot-docs"}
+
+
+def table(rows_: list[dict]) -> str:
+    if not rows_:
+        return "(no rows)"
+    cols = list(rows_[0])
+    cell = lambda v: (json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else "" if v is None else str(v))[:60]
+    widths = [max(len(c), *(len(cell(r.get(c))) for r in rows_)) for c in cols]
+    line = lambda vals: "  ".join(v.ljust(w) for v, w in zip(vals, widths)).rstrip()
+    return "\n".join([line(cols), line(["-" * w for w in widths]), *(line([cell(r.get(c)) for c in cols]) for r in rows_)])
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    command = "?"
+    try:
+        args = build_parser().parse_args(argv)
+        command = args.command or "triage"
+        c = None if args.command in NO_CONTRACT else find_contract(args)
+        data, nxt = HANDLERS[args.command](args, c)
+        if command == "guide" or command in ("help", "robot-docs"):
+            sys.stdout.write(data["text"])
+            return OK
+        if getattr(args, "table", False):
+            print(table(data.get("rows") or data.get("timeline") or []))
+            if data.get("truncated"):
+                log("truncated; " + (nxt[0] if nxt else "raise --limit"))
+            return OK
+        print(json.dumps({"ok": True, "command": command, "data": data, "next": nxt}, ensure_ascii=False, default=str))
+        return OK
+    except Fail as e:
+        print(json.dumps({"ok": False, "command": command,
+                          "error": {"code": e.code, "kind": EXIT_CODES.get(e.code, "").split(":")[0], "message": e.message,
+                                    "try": e.try_}, **({"data": e.detail} if e.detail else {})},
+                         ensure_ascii=False, default=str))
+        log(e.message + (f"\n  try: {e.try_[0]}" if e.try_ else ""))
+        return e.code
+    except KeyboardInterrupt:
+        log("interrupted; `facts sync` resumes where it stopped")
+        return SOURCE
+    except SystemExit as e:  # --help / --version
+        return int(e.code or 0)
+    except Exception as e:  # never a bare traceback on stdout
+        import traceback
+        where = traceback.extract_tb(e.__traceback__)[-1]
+        message = f"{type(e).__name__}: {e} (facts line {where.lineno}, in {where.name})"
+        print(json.dumps({"ok": False, "command": command, "error": {"code": INTERNAL, "kind": "internal",
+                                                                      "message": message, "try": []}}, ensure_ascii=False))
+        log(message)
+        return INTERNAL
+
+
+if __name__ == "__main__":
+    sys.exit(main())
