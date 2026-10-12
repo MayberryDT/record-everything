@@ -389,6 +389,18 @@ def main() -> int:
     triage, doc3, _ = r.facts(cwd=fresh)
     r.case("init", "init writes a working facts.md once and never overwrites",
            code == 0 and again == 1 and triage == 0 and doc3["data"]["project"]["name"] == "demo")
+    # 35: a dir source whose .jsonl grows (an append-only log) is re-ingested without duplicates
+    grow = work / "grow"
+    (grow / "log").mkdir(parents=True)
+    (grow / "facts.md").write_text("---\nfacts: 1\nname: grow\nsource: {kind: dir, path: ./log}\ncache: .cache\n---\n")
+    line = lambda i: json.dumps(fact("note", 1760000000000 + i, "s1", "b1", actor=1, who="human")) + "\n"
+    (grow / "log" / "events.jsonl").write_text(line(1) + line(2))
+    r.facts("sync", cwd=grow)
+    with (grow / "log" / "events.jsonl").open("a") as f: f.write(line(3))
+    code, doc, _ = r.facts("sync", cwd=grow)
+    _, q, _ = r.facts("query", "SELECT count(*) AS n FROM facts_all", cwd=grow)
+    r.case("35", "a grown dir .jsonl is re-ingested, replacing its rows",
+           code == 0 and doc["data"]["ingested"] == 1 and q["data"]["rows"][0]["n"] == 3, json.dumps(q)[:200])
     code, doc, _ = r.facts("capabilities", cwd=work)
     r.case("caps", "capabilities works without a contract", code == 0 and doc["data"]["exit_codes"])
 

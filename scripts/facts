@@ -411,6 +411,7 @@ def ingest(con, c: Contract, key: str, path: Path, size) -> dict:
         if c.restart_sql:  # actor numbers restart here: later facts belong to a new segment of the session
             con.execute(f"""INSERT INTO restarts SELECT DISTINCT session, t FROM stage2
                 WHERE session IS NOT NULL AND t IS NOT NULL AND ({c.restart_sql})""")
+        con.execute("DELETE FROM facts_all WHERE object = ?", [key])  # a re-ingested key replaces its rows
         con.execute("""INSERT INTO facts_all SELECT ?, s.kind, s.t,
             CASE WHEN s.t BETWEEN -1e15 AND 1e15 THEN make_timestamp(CAST(s.t * 1000 AS BIGINT)) END,
             s.session, coalesce(r.t, 0), s.build, s.actor, s.target, s.who, s.data
@@ -493,8 +494,9 @@ def cmd_sync(args, c: Contract):
         if rebuild:
             con.execute("DROP TABLE IF EXISTS facts_all; DROP TABLE IF EXISTS objects; DROP TABLE IF EXISTS restarts;")
             con.execute(SCHEMA)
-        done = {r[0] for r in con.execute("SELECT key FROM objects WHERE error IS NULL").fetchall()}
-        todo = [o for o in listed if o["key"] not in done]
+        done = dict(con.execute("SELECT key, size FROM objects WHERE error IS NULL").fetchall())
+        # A key is ingested once, unless its listed size changed (a growing local .jsonl, a replaced object).
+        todo = [o for o in listed if o["key"] not in done or (o.get("size") is not None and o.get("size") != done[o["key"]])]
         pending = len(todo)
         if args.limit:
             todo = todo[: args.limit]
