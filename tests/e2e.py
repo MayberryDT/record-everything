@@ -401,6 +401,15 @@ def main() -> int:
     _, q, _ = r.facts("query", "SELECT count(*) AS n FROM facts_all", cwd=grow)
     r.case("35", "a grown dir .jsonl is re-ingested, replacing its rows",
            code == 0 and doc["data"]["ingested"] == 1 and q["data"]["rows"][0]["n"] == 3, json.dumps(q)[:200])
+    # 37: a new cache stores the raw JSON zstd-compressed
+    _, q, _ = r.facts("query", "SELECT DISTINCT compression FROM pragma_storage_info('facts_all') WHERE column_name = 'data'", cwd=grow)
+    r.case("37", "a new cache compresses the raw JSON with zstd",
+           "ZSTD" in [row["compression"] for row in q["data"]["rows"]], json.dumps(q)[:200])
+    # 36: a deleted dir source left the cache answering with no sign it could no longer be refreshed
+    shutil.rmtree(grow / "log")
+    _, doc, _ = r.facts(cwd=grow)
+    ids = [w["id"] for w in doc["data"]["warnings"]]
+    r.case("36", "a missing dir source is a fail-level warning", "source-missing" in ids, str(ids))
     code, doc, _ = r.facts("capabilities", cwd=work)
     r.case("caps", "capabilities works without a contract", code == 0 and doc["data"]["exit_codes"])
 

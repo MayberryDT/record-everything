@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["duckdb>=1.1,<2", "pyyaml>=6"]
+# dependencies = ["duckdb>=1.2,<2", "pyyaml>=6"]
 # ///
 """facts: read an app's recorded facts. Agent-first; run `facts guide` for the handbook.
 
@@ -202,8 +202,10 @@ def open_db(c: Contract, write: bool = False):
     if not write and not c.db_path.exists():
         raise Fail(NOT_SYNCED, f"nothing synced yet for {c.name} (expected {c.db_path})", ["facts sync"])
     c.cache.mkdir(parents=True, exist_ok=True)
+    # Storage v1.2 allows zstd for strings, which stores the raw JSON about 15x smaller. Older caches keep their format.
+    config = {"storage_compatibility_version": "v1.2.0"} if write and not c.db_path.exists() else {}
     try:
-        con = duckdb.connect(str(c.db_path), read_only=not write)
+        con = duckdb.connect(str(c.db_path), read_only=not write, config=config)
     except duckdb.IOException as e:
         if "lock" in str(e).lower():
             raise Fail(BUSY, f"another `facts sync` is using {c.db_path}; retry when it finishes")
@@ -213,6 +215,9 @@ def open_db(c: Contract, write: bool = False):
     con.execute(f"SET temp_directory = {q(str(c.cache / 'tmp'))}")  # big reads spill here instead of failing
     if write:
         con.execute("SET preserve_insertion_order = false")
+        storage = con.execute("SELECT tags['storage_version'] FROM duckdb_databases() WHERE database_name = current_database()").fetchone()[0]
+        if not (storage or "v1.0").startswith(("v0.", "v1.0", "v1.1")):
+            con.execute("SET force_compression = 'zstd'")
     if not write:
         BROKEN_VIEWS.clear()
         BROKEN_VIEWS.update(define_views(con, c))
@@ -321,9 +326,13 @@ def redact(url: str) -> str:
     return re.sub(r"(token|key|sig|signature)=[^&]+", r"\1=…", url)
 
 
+def source_dir(c: Contract) -> Path:
+    return (c.root / Path(c.source["path"]).expanduser()).resolve()
+
+
 def list_source(c: Contract, tok: str | None) -> list[dict]:
     if c.source["kind"] == "dir":
-        base = (c.root / Path(c.source["path"]).expanduser()).resolve()
+        base = source_dir(c)
         if not base.is_dir():
             raise Fail(SOURCE, f"source.path {base} is not a directory")
         files = sorted(p for p in base.rglob("*") if p.is_file() and (p.name.endswith(".jsonl.gz") or p.name.endswith(".jsonl")))
@@ -395,38 +404,51 @@ def validate_mapping(c: Contract) -> None:
                        ["facts guide contract"])
 
 
-def ingest(con, c: Contract, key: str, path: Path, size) -> dict:
+INGEST_BATCH = 256  # objects per transaction: a commit costs 50-250 ms, so one per object made a large sync take hours
+
+
+def ingest(con, c: Contract, batch: list[tuple[str, Path, object]]) -> list[dict]:
+    """Ingest (key, path, size) objects in one transaction. If one fails, retry them singly so only it is recorded."""
     con.execute("BEGIN")
     try:
-        con.execute("DROP TABLE IF EXISTS stage")
-        con.execute(f"CREATE TEMP TABLE stage AS SELECT json FROM read_json_objects({q(str(path))}, "
-                    "format='newline_delimited', ignore_errors=true, maximum_object_size=268435456)")
-        lines, bad = con.execute("SELECT count(*), count(*) FILTER (json IS NULL) FROM stage").fetchone()
-        e = c.expr
-        con.execute("DROP TABLE IF EXISTS stage2")
-        con.execute(f"""CREATE TEMP TABLE stage2 AS SELECT CAST({e('kind')} AS VARCHAR) AS kind, TRY_CAST({e('t')} AS DOUBLE) AS t,
-            CAST({e('session')} AS VARCHAR) AS session, CAST({e('build')} AS VARCHAR) AS build,
-            CAST({e('actor')} AS VARCHAR) AS actor, CAST({e('target')} AS VARCHAR) AS target,
-            lower(CAST({e('who')} AS VARCHAR)) AS who, json AS data FROM stage WHERE json IS NOT NULL""")
-        if c.restart_sql:  # actor numbers restart here: later facts belong to a new segment of the session
-            con.execute(f"""INSERT INTO restarts SELECT DISTINCT session, t FROM stage2
-                WHERE session IS NOT NULL AND t IS NOT NULL AND ({c.restart_sql})""")
-        con.execute("DELETE FROM facts_all WHERE object = ?", [key])  # a re-ingested key replaces its rows
-        con.execute("""INSERT INTO facts_all SELECT ?, s.kind, s.t,
-            CASE WHEN s.t BETWEEN -1e15 AND 1e15 THEN make_timestamp(CAST(s.t * 1000 AS BIGINT)) END,
-            s.session, coalesce(r.t, 0), s.build, s.actor, s.target, s.who, s.data
-            FROM stage2 s ASOF LEFT JOIN restarts r ON s.session = r.session AND s.t >= r.t""", [key])
-        con.execute("DELETE FROM objects WHERE key = ?", [key])
-        con.execute("INSERT INTO objects VALUES (?, ?, ?, ?, ?, now(), NULL)", [key, size, lines, bad, lines - bad])
-        con.execute("DROP TABLE stage; DROP TABLE stage2")
+        results = [ingest_rows(con, c, *item) for item in batch]
         con.execute("COMMIT")
-        return {"lines": lines, "bad": bad}
+        return results
     except Exception as ex:
-        con.execute("ROLLBACK")
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        if len(batch) > 1:
+            return [r for item in batch for r in ingest(con, c, [item])]
+        key, _, size = batch[0]
         message = str(ex).splitlines()[0][:300]
         con.execute("DELETE FROM objects WHERE key = ?", [key])
         con.execute("INSERT INTO objects VALUES (?, ?, NULL, NULL, NULL, now(), ?)", [key, size, message])
-        return {"error": message}
+        return [{"error": message}]
+
+
+def ingest_rows(con, c: Contract, key: str, path: Path, size) -> dict:
+    con.execute("DROP TABLE IF EXISTS stage")
+    con.execute(f"CREATE TEMP TABLE stage AS SELECT json FROM read_json_objects({q(str(path))}, "
+                "format='newline_delimited', ignore_errors=true, maximum_object_size=268435456)")
+    lines, bad = con.execute("SELECT count(*), count(*) FILTER (json IS NULL) FROM stage").fetchone()
+    e = c.expr
+    con.execute("DROP TABLE IF EXISTS stage2")
+    con.execute(f"""CREATE TEMP TABLE stage2 AS SELECT CAST({e('kind')} AS VARCHAR) AS kind, TRY_CAST({e('t')} AS DOUBLE) AS t,
+        CAST({e('session')} AS VARCHAR) AS session, CAST({e('build')} AS VARCHAR) AS build,
+        CAST({e('actor')} AS VARCHAR) AS actor, CAST({e('target')} AS VARCHAR) AS target,
+        lower(CAST({e('who')} AS VARCHAR)) AS who, json AS data FROM stage WHERE json IS NOT NULL""")
+    if c.restart_sql:  # actor numbers restart here: later facts belong to a new segment of the session
+        con.execute(f"""INSERT INTO restarts SELECT DISTINCT session, t FROM stage2
+            WHERE session IS NOT NULL AND t IS NOT NULL AND ({c.restart_sql})""")
+    con.execute("DELETE FROM facts_all WHERE object = ?", [key])  # a re-ingested key replaces its rows
+    con.execute("""INSERT INTO facts_all SELECT ?, s.kind, s.t,
+        CASE WHEN s.t BETWEEN -1e15 AND 1e15 THEN make_timestamp(CAST(s.t * 1000 AS BIGINT)) END,
+        s.session, coalesce(r.t, 0), s.build, s.actor, s.target, s.who, s.data
+        FROM stage2 s ASOF LEFT JOIN restarts r ON s.session = r.session AND s.t >= r.t""", [key])
+    con.execute("DELETE FROM objects WHERE key = ?", [key])
+    con.execute("INSERT INTO objects VALUES (?, ?, ?, ?, ?, now(), NULL)", [key, size, lines, bad, lines - bad])
+    con.execute("DROP TABLE stage; DROP TABLE stage2")
+    return {"lines": lines, "bad": bad}
 
 
 def derive(con, c: Contract) -> None:
@@ -502,28 +524,31 @@ def cmd_sync(args, c: Contract):
             todo = todo[: args.limit]
         log(f"{len(listed)} objects at the source, {len(todo)} to ingest")
         ingested = failed = lines = bad = 0
-        failures, last = [], time.time()
+        failures, last, batch = [], time.time(), []
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             futures = [(o, pool.submit(download, c, tok, o)) for o in todo]
             for i, (o, future) in enumerate(futures, 1):
+                finished = []
                 try:
-                    path = future.result()
+                    batch.append((o, future.result()))
                 except Fail as e:
                     if e.code == SOURCE and "rejected the token" in e.message:
                         pool.shutdown(cancel_futures=True)
                         raise
-                    result = {"error": e.message}
+                    finished.append((o, {"error": e.message}))
                     con.execute("DELETE FROM objects WHERE key = ?", [o["key"]])
                     con.execute("INSERT INTO objects VALUES (?, ?, NULL, NULL, NULL, now(), ?)", [o["key"], o.get("size"), e.message])
-                else:
-                    result = ingest(con, c, o["key"], path, o.get("size"))
-                if "error" in result:
-                    failed += 1
-                    failures.append({"key": o["key"], "error": result["error"]})
-                else:
-                    ingested += 1
-                    lines += result["lines"]
-                    bad += result["bad"]
+                if batch and (len(batch) >= INGEST_BATCH or i == len(futures)):
+                    finished += zip([b for b, _ in batch], ingest(con, c, [(b["key"], path, b.get("size")) for b, path in batch]))
+                    batch = []
+                for done_obj, result in finished:
+                    if "error" in result:
+                        failed += 1
+                        failures.append({"key": done_obj["key"], "error": result["error"]})
+                    else:
+                        ingested += 1
+                        lines += result["lines"]
+                        bad += result["bad"]
                 if time.time() - last > 10 or i == len(futures):
                     last = time.time()
                     log(f"[{i}/{len(futures)}] {ingested} ingested, {failed} failed, {lines} lines")
@@ -584,8 +609,11 @@ def quick_warnings(con, c: Contract) -> list[dict]:
     bad = scalar(con, "SELECT coalesce(sum(bad_lines), 0) FROM objects")
     if bad:
         w.append({"id": "bad-lines", "level": "warn", "about": f"{bad} line(s) were not valid JSON", "try": "facts check"})
+    if c.source["kind"] == "dir" and not source_dir(c).is_dir():
+        w.append({"id": "source-missing", "level": "fail", "about": f"source.path {source_dir(c)} is gone, so these facts "
+                  "can no longer be refreshed", "try": "facts notes"})
     if c.fresh_hours:
-        age = scalar(con, "SELECT (epoch_ms(now()) - max(t)) / 3.6e6 FROM facts_all")
+        age = scalar(con,"SELECT (epoch_ms(now()) - max(t)) / 3.6e6 FROM facts_all")
         if age is None or age > float(c.fresh_hours):
             w.append({"id": "stale", "level": "warn", "about": f"newest fact is {age and round(age, 1)} h old (fresh_hours {c.fresh_hours})",
                       "try": "facts sync"})
